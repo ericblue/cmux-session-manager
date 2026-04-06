@@ -1,4 +1,4 @@
-.PHONY: help list-active show snapshot list-snapshots validate prune restore restore-dry-run kill respawn install
+.PHONY: help list-active show snapshot list-snapshots diff validate prune restore restore-dry-run kill respawn install
 
 SCRIPT := python3 $(CURDIR)/cmux-sessions.py
 SNAP_DIR := $(HOME)/.cmux-snapshots
@@ -23,17 +23,20 @@ snapshot: ## Capture state (W= workspace, N= name, e.g. make snapshot W=devops N
 list-snapshots: ## List all saved snapshots
 	@$(SCRIPT) snapshots
 
+diff: ## Compare snapshot vs live workspaces (F= snapshot)
+	@$(SCRIPT) diff $(if $(F),-f $(call resolve_snap,$(F)))
+
 validate: ## Check snapshot health before restoring (F= snapshot, W= workspace)
 	@$(SCRIPT) validate $(if $(F),-f $(call resolve_snap,$(F))) $(if $(W),-w $(W))
 
 prune: ## Delete old snapshots, keep last N (KEEP=10)
 	@$(SCRIPT) prune --keep $(or $(KEEP),10)
 
-restore-dry-run: ## Preview restore (W= workspace, F= snapshot, RC=1 to run commands)
-	@$(SCRIPT) restore --dry-run $(if $(W),-w $(W)) $(if $(F),-f $(call resolve_snap,$(F))) $(if $(RC),--run-commands)
+restore-dry-run: ## Preview restore (W= workspace, F= snapshot, RC=1 commands, SA=1 skip active)
+	@$(SCRIPT) restore --dry-run $(if $(W),-w $(W)) $(if $(F),-f $(call resolve_snap,$(F))) $(if $(RC),--run-commands) $(if $(SA),--skip-active)
 
-restore: ## Restore from snapshot (W= workspace, F= snapshot, RC=1 to run commands)
-	@$(SCRIPT) restore $(if $(W),-w $(W)) $(if $(F),-f $(call resolve_snap,$(F))) $(if $(RC),--run-commands)
+restore: ## Restore from snapshot (W= workspace, F= snapshot, RC=1 commands, SA=1 skip active)
+	@$(SCRIPT) restore $(if $(W),-w $(W)) $(if $(F),-f $(call resolve_snap,$(F))) $(if $(RC),--run-commands) $(if $(SA),--skip-active)
 
 kill: ## Close a workspace with confirmation (requires W=)
 	@test -n "$(W)" || (echo "Usage: make kill W=<workspace>"; exit 1)

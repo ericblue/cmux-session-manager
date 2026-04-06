@@ -11,9 +11,11 @@ Usage:
   cmux-sessions snapshot -w myproject     # Snapshot only matching workspace
   cmux-sessions snapshot -o state.json    # Save to specific file
   cmux-sessions list                      # Show active Claude sessions
+  cmux-sessions diff                      # Compare snapshot vs live workspaces
   cmux-sessions restore                   # Restore from latest snapshot
   cmux-sessions restore -w myproject      # Restore only matching workspace
   cmux-sessions restore -f state.json     # Restore from specific file
+  cmux-sessions restore --skip-active     # Restore only closed workspaces
   cmux-sessions restore --dry-run         # Preview what would be restored
 """
 
@@ -794,6 +796,7 @@ def cmd_restore(args):
 
     ws_filter = getattr(args, "workspace", None)
     run_commands = getattr(args, "run_commands", False)
+    skip_active = getattr(args, "skip_active", False)
     home = os.path.expanduser("~")
 
     print(f"Restoring from: {snap_path}")
@@ -802,12 +805,22 @@ def cmd_restore(args):
         print(f"Workspace filter: {ws_filter}")
     print()
 
+    # When --skip-active, determine which workspaces are already open
+    active_titles = set()
+    if skip_active:
+        try:
+            live_workspaces = _get_live_workspaces()
+            active_titles = {ws["title"].lower() for ws in live_workspaces}
+        except SystemExit:
+            pass  # can't query cmux; proceed without filtering
+
     # Build ordered restore plan
     steps = []
     total_workspaces = 0
     total_panels = 0
     total_claude = 0
     skipped = []
+    skipped_active = []
     matched_any = False
 
     for win in snap.get("windows", []):
@@ -824,6 +837,12 @@ def cmd_restore(args):
                 if not match:
                     continue
             matched_any = True
+
+            # Skip workspaces that are already open
+            if skip_active and title.lower() in active_titles:
+                skipped_active.append(title)
+                continue
+
             cwd = ws.get("cwd", "")
 
             if not cwd or not os.path.isdir(cwd):
@@ -980,6 +999,12 @@ def cmd_restore(args):
         sys.exit(1)
 
     # Print plan
+    if skipped_active:
+        print(f"Skipped (already open): {len(skipped_active)} workspace(s)")
+        for t in skipped_active:
+            print(f"  - {t}")
+        print()
+
     if skipped:
         print("Skipped (directory not found):")
         for title, cwd in skipped:
@@ -988,13 +1013,22 @@ def cmd_restore(args):
 
     non_claude = total_panels - total_claude
 
-    # Collect workspace titles for display
+    # Collect workspace titles for display (exclude skipped-active)
+    skipped_active_lower = {t.lower() for t in skipped_active}
     ws_titles = [
         ws.get("title", "untitled")
         for win in snap.get("windows", [])
         for ws in win.get("workspaces", [])
         if _snap_ws_matches(ws, ws_filter)
+        and ws.get("title", "untitled").lower() not in skipped_active_lower
     ]
+
+    if total_workspaces == 0:
+        if skipped_active:
+            print("All matching workspaces are already open. Nothing to restore.")
+        else:
+            print("No workspaces to restore.")
+        return
 
     print(f"Plan: {total_workspaces} workspaces, {total_panels} panels ({total_claude} Claude, {non_claude} terminal)")
     for t in ws_titles:
@@ -1463,6 +1497,77 @@ def cmd_validate(args):
         sys.exit(1)
 
 
+def cmd_diff(args):
+    """Compare a snapshot against live cmux workspaces."""
+    if args.file:
+        snap_path = args.file
+    else:
+        snap_path = os.path.join(SNAPSHOT_DIR, "latest.json")
+
+    if not os.path.exists(snap_path):
+        print(f"Error: Snapshot not found at {snap_path}", file=sys.stderr)
+        sys.exit(1)
+
+    with open(snap_path) as f:
+        snap = json.load(f)
+
+    # Get snapshot workspace titles
+    snap_workspaces = {}
+    for win in snap.get("windows", []):
+        for ws in win.get("workspaces", []):
+            title = ws.get("title", "untitled")
+            panels = ws.get("panels", [])
+            claude_count = sum(1 for p in panels if p.get("isClaude"))
+            snap_workspaces[title] = {
+                "panels": len(panels),
+                "claude": claude_count,
+                "terminal": len(panels) - claude_count,
+            }
+
+    # Get live workspace titles
+    try:
+        live_workspaces = _get_live_workspaces()
+        live_titles = {ws["title"] for ws in live_workspaces}
+    except SystemExit:
+        print("Error: Cannot query live workspaces. Are you inside cmux?", file=sys.stderr)
+        sys.exit(1)
+
+    # Categorize
+    snap_titles = set(snap_workspaces.keys())
+    active = snap_titles & live_titles
+    closed = snap_titles - live_titles
+    extra = live_titles - snap_titles
+
+    print(f"Snapshot:  {os.path.basename(snap_path)} ({snap.get('timestamp', 'unknown')})")
+    print(f"Total:     {len(snap_titles)} in snapshot, {len(live_titles)} live")
+    print()
+
+    if closed:
+        print(f"Closed ({len(closed)}) — in snapshot but not running:")
+        for t in sorted(closed):
+            info = snap_workspaces[t]
+            print(f"  - {t}  ({info['panels']} panels: {info['claude']}C/{info['terminal']}T)")
+        print()
+
+    if active:
+        print(f"Active ({len(active)}) — in snapshot and currently running:")
+        for t in sorted(active):
+            info = snap_workspaces[t]
+            print(f"  - {t}  ({info['panels']} panels: {info['claude']}C/{info['terminal']}T)")
+        print()
+
+    if extra:
+        print(f"New ({len(extra)}) — running but not in snapshot:")
+        for t in sorted(extra):
+            print(f"  - {t}")
+        print()
+
+    if not closed:
+        print("All snapshot workspaces are currently active.")
+    else:
+        print(f"To restore closed workspaces: make restore SA=1" + (f" F={os.path.basename(snap_path).replace('.json', '')}" if args.file else ""))
+
+
 def cmd_prune(args):
     """Delete old snapshots, keeping the most recent N."""
     if not os.path.isdir(SNAPSHOT_DIR):
@@ -1697,12 +1802,14 @@ examples:
   %(prog)s snapshot -w myproject           Snapshot only matching workspace
   %(prog)s snapshot -n before-refactor     Save with a name instead of timestamp
   %(prog)s snapshots                       List all saved snapshots
+  %(prog)s diff                            Compare snapshot vs live workspaces
   %(prog)s validate                        Check snapshot health before restoring
   %(prog)s validate -f snap.json -w proj   Validate specific snapshot/workspace
   %(prog)s prune                           Delete old snapshots (keep last 10)
   %(prog)s prune --keep 5                  Keep last 5 snapshots
   %(prog)s restore --dry-run               Preview what would be restored
   %(prog)s restore -w myproject            Restore only matching workspace
+  %(prog)s restore --skip-active           Restore only closed workspaces
   %(prog)s restore --run-commands          Re-run captured terminal commands
   %(prog)s kill -w myproject               Close a workspace (with confirmation)
   %(prog)s respawn -w myproject            Snapshot, kill, and restore a workspace
@@ -1733,6 +1840,11 @@ examples:
     p_restore.add_argument("-w", "--workspace", help="Restore only this workspace (name substring or index)")
     p_restore.add_argument("--dry-run", action="store_true", help="Preview without executing")
     p_restore.add_argument("--run-commands", action="store_true", help="Re-run captured terminal commands (use with caution)")
+    p_restore.add_argument("--skip-active", action="store_true", help="Skip workspaces that are already open (restore only closed ones)")
+
+    # diff
+    p_diff = sub.add_parser("diff", help="Compare snapshot against live workspaces")
+    p_diff.add_argument("-f", "--file", help="Snapshot file (default: latest)")
 
     # validate
     p_val = sub.add_parser("validate", help="Check snapshot health before restoring")
@@ -1759,6 +1871,7 @@ examples:
         "show": cmd_show,
         "snapshot": cmd_snapshot,
         "snapshots": cmd_snapshots,
+        "diff": cmd_diff,
         "validate": cmd_validate,
         "prune": cmd_prune,
         "restore": cmd_restore,

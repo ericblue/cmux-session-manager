@@ -1,6 +1,6 @@
 # cmux-session-manager
 
-Snapshot and restore cmux workspaces with Claude Code session resumption.
+Snapshot and restore [cmux](https://cmux.com/) workspaces with Claude Code session resumption.
 
 When cmux crashes or is restarted, this tool recreates your workspace layout — splits, panels, working directories, Claude sessions, and optionally terminal commands — and resumes everything where it left off.
 
@@ -75,6 +75,19 @@ make restore-dry-run W=devops-work F=cmux-20260405-161401
 make restore W=devops-work F=cmux-20260405-161401
 ```
 
+### Restore only closed workspaces from a snapshot
+
+```bash
+# See which workspaces from the snapshot are active vs closed
+make diff
+
+# Restore only the ones that aren't currently running
+make restore SA=1
+
+# Combine with a specific snapshot
+make restore SA=1 F=cmux-20260405-161401
+```
+
 ### Restore with dev servers and watchers
 
 ```bash
@@ -119,10 +132,11 @@ make list-active        List active Claude sessions with git branches
 make show               Show detailed workspace info (W= workspace, F= snapshot)
 make snapshot           Capture state (W= workspace, N= name)
 make list-snapshots     List all saved snapshots with workspace names
+make diff               Compare snapshot vs live workspaces (F= snapshot)
 make validate           Check snapshot health before restoring (F= snapshot, W= workspace)
 make prune              Delete old snapshots, keep last N (KEEP=10)
-make restore-dry-run    Preview restore (W= workspace, F= snapshot, RC=1 for commands)
-make restore            Restore from snapshot (W= workspace, F= snapshot, RC=1 for commands)
+make restore-dry-run    Preview restore (W= workspace, F= snapshot, RC=1, SA=1)
+make restore            Restore from snapshot (W= workspace, F= snapshot, RC=1, SA=1)
 make kill               Close a workspace with confirmation (requires W=)
 make respawn            Snapshot, kill, and restore a workspace (requires W=)
 make install            Symlink cmux-sessions into ~/bin
@@ -136,6 +150,7 @@ make install            Symlink cmux-sessions into ~/bin
 | `F=`     | Snapshot file (bare name, with .json, or full path) | `F=cmux-20260405-161401` |
 | `N=`     | Named snapshot (instead of timestamp) | `N=before-refactor` |
 | `RC=1`   | Re-run captured terminal commands on restore | `RC=1` |
+| `SA=1`   | Skip already-active workspaces on restore | `SA=1` |
 | `KEEP=`  | Number of snapshots to keep when pruning (default: 10) | `KEEP=5` |
 
 ## CLI Commands
@@ -148,12 +163,15 @@ cmux-sessions snapshot                        Save current state (all workspaces
 cmux-sessions snapshot -w myproject           Snapshot only matching workspace
 cmux-sessions snapshot -n before-refactor     Save with a name instead of timestamp
 cmux-sessions snapshots                       List all saved snapshots
+cmux-sessions diff                            Compare snapshot vs live workspaces
+cmux-sessions diff -f snap.json               Compare specific snapshot vs live
 cmux-sessions validate                        Check snapshot health before restoring
 cmux-sessions validate -f snap.json -w proj   Validate specific snapshot/workspace
 cmux-sessions prune                           Delete old snapshots (keep last 10)
 cmux-sessions prune --keep 5                  Keep last 5 snapshots
 cmux-sessions restore --dry-run               Preview what would be restored
 cmux-sessions restore -w myproject            Restore only matching workspace
+cmux-sessions restore --skip-active           Restore only closed workspaces
 cmux-sessions restore --run-commands          Re-run saved terminal commands
 cmux-sessions kill -w myproject               Close a workspace (with confirmation)
 cmux-sessions kill -w myproject -y            Close without confirmation
