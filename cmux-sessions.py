@@ -562,12 +562,14 @@ def cmd_list(args):
             non_claude_count = total_panels - claude_count
             panels_str = f"{total_panels} ({claude_count}C/{non_claude_count}T)"
 
+            has_claude = False
             for panel in all_panels:
                 panel_title = panel.get("title", "")
                 is_claude = "Claude" in panel_title or panel_title.startswith("\u2733")
                 if not is_claude:
                     continue
 
+                has_claude = True
                 panel_dir = panel.get("terminal", {}).get(
                     "workingDirectory", panel.get("directory", "")
                 )
@@ -606,8 +608,19 @@ def cmd_list(args):
 
                 rows.append((ws_title, panels_str, clean_title, short_dir, branch, session_id, status))
 
+            # Show workspaces that have no Claude panels
+            if not has_claude:
+                ws_cwd = ws.get("currentDirectory", "")
+                short_dir = ws_cwd.replace(os.path.expanduser("~"), "~")
+                if len(short_dir) > 45:
+                    short_dir = "..." + short_dir[-42:]
+                branch = get_git_branch(ws_cwd) or "-" if ws_cwd else "-"
+                if len(branch) > 20:
+                    branch = branch[:17] + "..."
+                rows.append((ws_title, panels_str, "-", short_dir, branch, "-", "-"))
+
     if not rows:
-        print("No Claude sessions found in cmux workspaces.")
+        print("No workspaces found in cmux.")
         return
 
     headers = ("WORKSPACE", "PANELS", "CLAUDE SESSION", "DIRECTORY", "BRANCH", "SESSION ID", "STATUS")
@@ -619,8 +632,10 @@ def cmd_list(args):
     for row in rows:
         print(fmt.format(*row))
 
-    running = sum(1 for r in rows if r[6] == "running")
-    print(f"\n{len(rows)} Claude panels, {running} running")
+    total_ws = len(set(r[0] for r in rows))
+    claude_rows = [r for r in rows if r[6] != "-"]
+    running = sum(1 for r in claude_rows if r[6] == "running")
+    print(f"\n{total_ws} workspaces, {len(claude_rows)} Claude panels ({running} running)")
 
 
 def cmd_show(args):
