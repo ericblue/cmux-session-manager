@@ -1128,13 +1128,24 @@ _BARE_VAR_RE = re.compile(r"^\$\{(\w+)\}$")
 
 
 def _resolve_argv(argv, env):
-    """Substitute ${VAR} references in each token using env."""
+    """Substitute ${VAR} references. Returns (resolved_argv, missing_vars).
+
+    A missing var is one that's referenced as ${X} but not in env. Callers
+    must treat any missing var as fatal — otherwise the ${X} literal gets
+    passed to cmux, which falls back to "current/focused" context and the
+    command lands on the caller's pane instead of the target workspace.
+    """
     out = []
+    missing = []
     for tok in argv:
-        out.append(_VAR_TOKEN_RE.sub(
-            lambda m: env.get(m.group(1), m.group(0)), tok
-        ))
-    return out
+        def sub(m):
+            v = env.get(m.group(1))
+            if v is None:
+                missing.append(m.group(1))
+                return m.group(0)
+            return v
+        out.append(_VAR_TOKEN_RE.sub(sub, tok))
+    return out, missing
 
 
 def _bash_token(tok):
@@ -1245,12 +1256,50 @@ def _build_workspace_steps(ws, ws_num, run_commands, home):
     selected_surface_var = [None]
     panel_count = [0]
     claude_count = [0]
+    first_pane_var = [None]  # remember the workspace's initial pane for orphans
 
-    def emit_pane(pane_node, is_first_pane, split_dir):
+    def emit_panel(panel, surf_var, pane_var):
+        """Emit send + rename-tab steps for a single restored panel."""
+        panel_dir = (panel.get("directory") or cwd or "").strip()
+        launch = _panel_launch_text(panel, panel_dir, run_commands)
+        if launch:
+            steps.append({
+                "type": "send",
+                "desc": f"    Launch: {launch[:70]}",
+                "argv": ["cmux", "send",
+                         "--workspace", f"${{{ws_var}}}",
+                         "--surface", f"${{{surf_var}}}",
+                         launch],
+                "post_enter": True,
+                "ws_var": ws_var,
+                "surf_var": surf_var,
+            })
+
+        # Only restore the tab title if the user explicitly renamed it.
+        # cmux makes `tab-action rename` sticky — it overrides subsequent
+        # OSC title escapes from the process. Re-applying a process-
+        # derived title (e.g. Claude's "✳ Reading file") would freeze the
+        # tab on that stale status instead of letting Claude update it.
+        custom_title = (panel.get("customTitle") or "").strip()
+        if custom_title:
+            steps.append({
+                "type": "rename-tab",
+                "desc": f"    Rename tab: {custom_title[:60]}",
+                "argv": ["cmux", "rename-tab",
+                         "--workspace", f"${{{ws_var}}}",
+                         "--surface", f"${{{surf_var}}}",
+                         custom_title],
+            })
+
+        panel_count[0] += 1
+        if panel.get("isClaude"):
+            claude_count[0] += 1
+
+    def emit_pane(pane_node, is_first_pane, split_dir, parent_pane_var):
+        """Emit steps for one pane node. Returns this pane's pane_var."""
         panel_ids = pane_node.get("panelIds") or []
         pane_selected = (pane_node.get("selectedPanelId") or "").strip()
 
-        # Track the pane ref so additional tabs target the right region.
         pane_var = f"P{ws_num}_{surf_counter[0]}"
         pane_ref_known = False
 
@@ -1263,8 +1312,6 @@ def _build_workspace_steps(ws, ws_num, run_commands, home):
             surf_var = f"S{ws_num}_{surf_counter[0]}"
 
             if i == 0 and is_first_pane:
-                # The workspace's initial pane already has one surface.
-                # Look it up via list-pane-surfaces / list-panes.
                 steps.append({
                     "type": "lookup-initial",
                     "desc": f"  Initial tab: {(panel.get('title') or '')[:60]}",
@@ -1273,13 +1320,21 @@ def _build_workspace_steps(ws, ws_num, run_commands, home):
                     "pane_var": pane_var,
                 })
                 pane_ref_known = True
+                if first_pane_var[0] is None:
+                    first_pane_var[0] = pane_var
             elif i == 0:
-                # First panel of a non-initial pane => split off.
+                # First panel of a non-initial pane => split off the parent.
+                # Targeting --panel <parent> is essential for nested layouts;
+                # without it cmux uses its current/focused pane heuristic and
+                # deeper splits land in unpredictable places.
+                split_argv = ["cmux", "new-split", split_dir,
+                              "--workspace", f"${{{ws_var}}}"]
+                if parent_pane_var:
+                    split_argv += ["--panel", f"${{{parent_pane_var}}}"]
                 steps.append({
                     "type": "new-split",
                     "desc": f"  Split {split_dir}: {(panel.get('title') or '')[:50]}",
-                    "argv": ["cmux", "new-split", split_dir,
-                             "--workspace", f"${{{ws_var}}}"],
+                    "argv": split_argv,
                     "captures": [
                         {"var": surf_var, "pattern": r"surface:[0-9]+"},
                         {"var": pane_var, "pattern": r"pane:[0-9]+"},
@@ -1291,61 +1346,19 @@ def _build_workspace_steps(ws, ws_num, run_commands, home):
                 # --focus true is essential: cmux inserts new surfaces after
                 # the currently focused one, so without it every new tab lands
                 # at position 1, reversing the intended order.
+                new_surf_argv = ["cmux", "new-surface",
+                                 "--workspace", f"${{{ws_var}}}",
+                                 "--focus", "true"]
                 if pane_ref_known:
-                    steps.append({
-                        "type": "new-surface",
-                        "desc": f"  + Tab: {(panel.get('title') or '')[:60]}",
-                        "argv": ["cmux", "new-surface",
-                                 "--workspace", f"${{{ws_var}}}",
-                                 "--pane", f"${{{pane_var}}}",
-                                 "--focus", "true"],
-                        "captures": [{"var": surf_var, "pattern": r"surface:[0-9]+"}],
-                    })
-                else:
-                    steps.append({
-                        "type": "new-surface",
-                        "desc": f"  + Tab: {(panel.get('title') or '')[:60]}",
-                        "argv": ["cmux", "new-surface",
-                                 "--workspace", f"${{{ws_var}}}",
-                                 "--focus", "true"],
-                        "captures": [{"var": surf_var, "pattern": r"surface:[0-9]+"}],
-                    })
-
-            # Launch text: cd + (claude --resume / saved command).
-            panel_dir = (panel.get("directory") or cwd or "").strip()
-            launch = _panel_launch_text(panel, panel_dir, run_commands)
-            if launch:
+                    new_surf_argv += ["--pane", f"${{{pane_var}}}"]
                 steps.append({
-                    "type": "send",
-                    "desc": f"    Launch: {launch[:70]}",
-                    "argv": ["cmux", "send",
-                             "--workspace", f"${{{ws_var}}}",
-                             "--surface", f"${{{surf_var}}}",
-                             launch],
-                    "post_enter": True,
-                    "ws_var": ws_var,
-                    "surf_var": surf_var,
+                    "type": "new-surface",
+                    "desc": f"  + Tab: {(panel.get('title') or '')[:60]}",
+                    "argv": new_surf_argv,
+                    "captures": [{"var": surf_var, "pattern": r"surface:[0-9]+"}],
                 })
 
-            # Only restore the tab title if the user explicitly renamed it.
-            # cmux makes `tab-action rename` sticky — it overrides subsequent
-            # OSC title escapes from the process. Re-applying a process-
-            # derived title (e.g. Claude's "✳ Reading file") would freeze the
-            # tab on that stale status instead of letting Claude update it.
-            custom_title = (panel.get("customTitle") or "").strip()
-            if custom_title:
-                steps.append({
-                    "type": "rename-tab",
-                    "desc": f"    Rename tab: {custom_title[:60]}",
-                    "argv": ["cmux", "rename-tab",
-                             "--workspace", f"${{{ws_var}}}",
-                             "--surface", f"${{{surf_var}}}",
-                             custom_title],
-                })
-
-            panel_count[0] += 1
-            if panel.get("isClaude"):
-                claude_count[0] += 1
+            emit_panel(panel, surf_var, pane_var)
 
             # Remember which surface should be focused at the end.
             if focused_id and pid == focused_id:
@@ -1353,20 +1366,76 @@ def _build_workspace_steps(ws, ws_num, run_commands, home):
             elif not focused_id and pane_selected and pid == pane_selected:
                 selected_surface_var[0] = surf_var
 
-    def walk(node, is_first_pane, split_dir):
+        return pane_var if pane_ref_known else None
+
+    def walk(node, is_first_pane, split_dir, parent_pane_var):
+        """Walk the layout tree. Returns (still_first, last_leaf_pane_var).
+
+        Returning the *last* leaf (not the first) means each sibling split
+        attaches to the most-recently-created pane in the subtree above it.
+        This is the closest approximation of the original topology that
+        cmux's per-pane new-split CLI allows — cmux can't split a multi-
+        pane region as a unit, so arbitrary nested trees can't be perfectly
+        reconstructed.
+        """
         ntype = node.get("type")
         if ntype == "pane":
-            emit_pane(node, is_first_pane, split_dir)
-            return False
+            pv = emit_pane(node, is_first_pane, split_dir, parent_pane_var)
+            return False, pv
         if ntype == "split":
             orientation = node.get("orientation", "vertical")
             direction = "right" if orientation == "vertical" else "down"
-            still_first = walk(node.get("first", {}) or {}, is_first_pane, None)
-            walk(node.get("second", {}) or {}, False, direction)
-            return False
-        return is_first_pane
+            _, first_leaf = walk(
+                node.get("first", {}) or {}, is_first_pane, None, parent_pane_var)
+            _, second_leaf = walk(
+                node.get("second", {}) or {}, False, direction, first_leaf)
+            return False, second_leaf
+        return is_first_pane, parent_pane_var
 
-    walk(layout, True, None)
+    # If layout is empty/unknown, synthesize a single pane from all panels
+    # so we don't silently drop them.
+    if layout.get("type") not in ("pane", "split"):
+        all_ids = [p.get("id") for p in panels if p.get("id")]
+        layout = {
+            "type": "pane",
+            "panelIds": all_ids,
+            "selectedPanelId": focused_id or "",
+        }
+
+    walk(layout, True, None, None)
+
+    # Catch panels not referenced by the layout tree — append them as extra
+    # tabs in the initial pane. Otherwise they're silently dropped.
+    referenced = set()
+    def _collect_referenced(node):
+        ntype = node.get("type")
+        if ntype == "pane":
+            for pid in (node.get("panelIds") or []):
+                if pid:
+                    referenced.add(pid)
+        elif ntype == "split":
+            _collect_referenced(node.get("first") or {})
+            _collect_referenced(node.get("second") or {})
+    _collect_referenced(layout)
+
+    orphans = [p for p in panels if p.get("id") and p["id"] not in referenced]
+    for panel in orphans:
+        surf_counter[0] += 1
+        surf_var = f"S{ws_num}_{surf_counter[0]}"
+        new_surf_argv = ["cmux", "new-surface",
+                         "--workspace", f"${{{ws_var}}}",
+                         "--focus", "true"]
+        if first_pane_var[0]:
+            new_surf_argv += ["--pane", f"${{{first_pane_var[0]}}}"]
+        steps.append({
+            "type": "new-surface",
+            "desc": f"  + Orphan tab: {(panel.get('title') or '')[:50]}",
+            "argv": new_surf_argv,
+            "captures": [{"var": surf_var, "pattern": r"surface:[0-9]+"}],
+        })
+        emit_panel(panel, surf_var, first_pane_var[0])
+        if focused_id and panel.get("id") == focused_id:
+            selected_surface_var[0] = surf_var
 
     # 4. Focus the originally-focused tab.
     if selected_surface_var[0]:
@@ -1440,7 +1509,12 @@ def _print_dry_run(steps):
 def _execute_step(s, env):
     """Run one step against the live cmux socket. Mutates env with captured refs.
 
-    Returns True on success, False on warning, None on hard failure (caller may exit).
+    Returns True on success, None on hard failure (caller must exit).
+
+    Anything that would leave a downstream step running without a resolved
+    workspace/surface/pane ref is treated as fatal — otherwise the command
+    silently falls back to cmux's current/focused context and the restore
+    lands on the caller's pane.
     """
     step_type = s["type"]
     ws_var = s.get("ws_var", "")
@@ -1449,58 +1523,66 @@ def _execute_step(s, env):
     if step_type == "lookup-initial":
         ws_ref = env.get(s["ws_var"], "")
         if not ws_ref:
-            print(f"    WARNING: no workspace ref for {s['ws_var']}")
-            return False
+            print(f"    ERROR: no workspace ref for {s['ws_var']} — refusing to continue")
+            return None
         surfaces = _list_pane_surfaces(ws_ref)
         if not surfaces:
-            print(f"    WARNING: no surfaces found in {ws_ref}")
-            return False
+            print(f"    ERROR: no surfaces found in {ws_ref}")
+            return None
         env[s["surf_var"]] = surfaces[0]["ref"]
-        # Pane ref via list-panes
         ok, out, _ = _run_cmux(["cmux", "list-panes", "--workspace", ws_ref])
-        if ok:
-            m = re.search(r"pane:[0-9]+", out or "")
-            if m:
-                env[s["pane_var"]] = m.group(0)
-        print(f"             surface={env.get(s['surf_var'],'?')} pane={env.get(s['pane_var'],'?')}")
+        pane_m = re.search(r"pane:[0-9]+", out or "") if ok else None
+        if not pane_m:
+            print(f"    ERROR: could not resolve initial pane ref in {ws_ref}")
+            return None
+        env[s["pane_var"]] = pane_m.group(0)
+        print(f"             surface={env[s['surf_var']]} pane={env[s['pane_var']]}")
         return True
 
     argv = s.get("argv")
     if not argv:
         return True
 
-    resolved = _resolve_argv(argv, env)
+    resolved, missing = _resolve_argv(argv, env)
+    if missing:
+        print(f"    ERROR: unresolved refs {sorted(set(missing))} — refusing to run with caller's cmux context")
+        return None
+
     ok, out, err = _run_cmux(resolved)
     if not ok:
-        # new-workspace failure is fatal; others just warn.
-        if step_type == "new-workspace":
-            print(f"    ERROR: {err}")
-            return None
-        print(f"    WARNING: {err or '(failed)'}")
-        return False
+        # Steps that produce a ref later commands depend on are fatal.
+        # Side-effect-only steps (set-color, rename-tab, focus-panel,
+        # send) just warn — losing those degrades the restore but does
+        # not redirect future commands to the wrong workspace.
+        side_effect_only = {"set-color", "set-desc", "rename-tab",
+                            "focus-panel", "send"}
+        if step_type in side_effect_only:
+            print(f"    WARNING: {err or '(failed)'}")
+            return True
+        print(f"    ERROR: {err or '(failed)'}")
+        return None
 
-    # Capture refs from stdout.
+    # Capture refs from stdout. A capture miss is fatal — downstream
+    # placeholders for this var would silently expand to the current pane.
     for cap in s.get("captures", []):
         m = re.search(cap["pattern"], out or "")
-        if m:
-            env[cap["var"]] = m.group(0)
-            print(f"             {cap['var']}={m.group(0)}")
-        else:
-            print(f"    WARNING: could not capture {cap['var']} (pattern {cap['pattern']}) from output: {out!r}")
+        if not m:
+            print(f"    ERROR: could not capture {cap['var']} (pattern {cap['pattern']}) "
+                  f"from output: {out!r}")
+            return None
+        env[cap["var"]] = m.group(0)
+        print(f"             {cap['var']}={m.group(0)}")
 
-    # Optional Enter after send.
+    # Optional Enter after send. Both workspace and surface refs must be
+    # known — otherwise send-key would land on the caller's pane.
     if s.get("post_enter"):
-        send_argv = ["cmux", "send-key"]
-        if ws_var:
-            ws_ref = env.get(ws_var)
-            if ws_ref:
-                send_argv += ["--workspace", ws_ref]
-        if surf_var:
-            surf_ref = env.get(surf_var)
-            if surf_ref:
-                send_argv += ["--surface", surf_ref]
-        send_argv.append("Enter")
-        _run_cmux(send_argv)
+        ws_ref = env.get(ws_var) if ws_var else None
+        surf_ref = env.get(surf_var) if surf_var else None
+        if not ws_ref or not surf_ref:
+            print(f"    ERROR: post_enter missing ws/surf refs (ws={ws_ref!r}, surf={surf_ref!r})")
+            return None
+        _run_cmux(["cmux", "send-key", "--workspace", ws_ref,
+                   "--surface", surf_ref, "Enter"])
 
     return True
 
