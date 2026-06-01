@@ -356,6 +356,9 @@ export PATH="$HOME/Development/cmux-sessions:$PATH"
 | `~/.cmux-snapshots/` | Snapshot storage directory |
 | `~/.cmux-snapshots/latest.json` | Most recent snapshot (used by default restore) |
 | `~/.cmux-snapshots/restore.sh` | Generated restore script (outside cmux fallback) |
+| `~/.cmux-snapshots/cmux-sessions-watch.py` | Copy of the script the launchd agent invokes (created by `install-watch`) |
+| `~/.cmux-snapshots/auto-watch.log` | Stdout/stderr from each auto-snapshot run |
+| `~/Library/LaunchAgents/com.cmux-sessions.auto-snapshot.plist` | launchd agent that fires on cmux state writes |
 | `~/Library/Application Support/cmux/session-com.cmuxterm.app.json` | cmux's live session state (read-only) |
 | `~/.claude/projects/` | Claude Code session index and history files |
 
@@ -380,6 +383,7 @@ If you want a fixed cadence instead, a cron entry still works as a backstop:
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.8+ (no third-party packages)
 - cmux (macOS)
-- Claude Code CLI
+- Claude Code CLI (optional — only needed for `claude --resume` on restore)
+- `launchctl` (macOS, used by `install-watch`; not required for manual snapshots)
